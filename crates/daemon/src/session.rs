@@ -50,8 +50,8 @@ impl Default for Config {
             // origin is -width. Negative because Hyprland places the primary
             // at 0x0 and grows the layout both ways from there. Override with
             // `--position` to sit on the right instead.
-            position_x: -1920,
-            position_y: 0,
+            position_x: 0,
+            position_y: 1080,
             output_name: capture::VIRTUAL_OUTPUT_NAME.to_string(),
             stats: false,
         }
@@ -94,7 +94,14 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         }
     };
 
-    let output = VirtualOutput::create(&config.output_name, config.position_x, config.position_y)?;
+    let output = VirtualOutput::create(
+        &config.output_name,
+        width,
+        height,
+        config.fps,
+        config.position_x,
+        config.position_y,
+    )?;
     tracing::info!(
         "virtual output {} at {}x{}@{}",
         output.name(),
