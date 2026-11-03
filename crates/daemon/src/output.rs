@@ -250,6 +250,20 @@ fn restore_hyprland_monitor_state(
     Ok(())
 }
 
+fn hyprland_monitor_lua(
+    name: &str,
+    width: u32,
+    height: u32,
+    refresh: u32,
+    x: i32,
+    y: i32,
+) -> String {
+    let output = lua_string(name);
+    format!(
+        "hl.monitor({{ output = {output}, mode = \"{width}x{height}@{refresh}\", position = \"{x}x{y}\", scale = 1 }})"
+    )
+}
+
 /// A headless output, removed when dropped.
 pub struct VirtualOutput {
     compositor: Compositor,
@@ -283,25 +297,14 @@ impl VirtualOutput {
                     std::thread::sleep(std::time::Duration::from_millis(400));
                 }
 
-                let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},1");
-                let reply = run("hyprctl", &["keyword", "monitor", &spec])
-                    .with_context(|| format!("configuring output as {spec}"))?;
-
-                // Hyprland's Lua config parser (0.56+) refuses `keyword`
-                // outright — and refuses it on stdout with a zero exit
-                // status, so `run` reports success and the output silently
-                // keeps the compositor's defaults. Re-issue the same rule
-                // through `eval`, which that parser does accept.
-                if reply.contains("non-legacy parsers") {
-                    let output = lua_string(name);
-                    let lua = format!(
-                        "hl.monitor({{ output = {}, \
-                         mode = \"{width}x{height}@{refresh}\", \
-                         position = \"{x}x{y}\", scale = 1 }})",
-                        output
-                    );
-                    run("hyprctl", &["eval", &lua])
-                        .with_context(|| format!("configuring output as {lua}"))?;
+                // Hyprland 0.57 responds "unknown request" to `hyprctl keyword`.
+                // The old conditional fallback consequently never ran, leaving
+                // the virtual output at 1920x1080 in the compositor's auto-layout.
+                // Use the supported Lua monitor API directly, unconditionally.
+                let lua = hyprland_monitor_lua(name, width, height, refresh, x, y);
+                if let Err(err) = run("hyprctl", &["eval", &lua]) {
+                    let _ = run("hyprctl", &["output", "remove", name]);
+                    return Err(err).with_context(|| format!("configuring output as {lua}"));
                 }
 
                 restore_hyprland_monitor_state(&saved_states, name)
@@ -334,5 +337,16 @@ impl Drop for VirtualOutput {
             Ok(_) => tracing::debug!("removed output {}", self.name),
             Err(e) => tracing::warn!("failed to remove output {}: {e}", self.name),
         }
+    }
+}
+
+#[cfg(test)]
+mod monitor_lua_tests {
+    use super::*;
+
+    #[test]
+    fn generates_hyprland_057_lua_for_tablet_mode() {
+        let code = hyprland_monitor_lua("moreland", 1340, 800, 60, 0, 1080);
+        assert_eq!(code, "hl.monitor({ output = \"moreland\", mode = \"1340x800@60\", position = \"0x1080\", scale = 1 })");
     }
 }
