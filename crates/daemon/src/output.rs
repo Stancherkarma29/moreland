@@ -105,27 +105,21 @@ fn run(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-pub fn output_exists(compositor: Compositor, name: &str) -> bool {
-    match compositor {
-        Compositor::Hyprland => run("hyprctl", &["monitors", "all"])
-            .map(|out| out.contains(name))
-            .unwrap_or(false),
-        Compositor::Sway => run("swaymsg", &["-t", "get_outputs"])
-            .map(|out| out.contains(name))
-            .unwrap_or(false),
-        Compositor::Unsupported => false,
-    }
-}
-
 #[derive(Debug, Clone)]
-struct MonitorPosition {
+struct MonitorState {
     name: String,
     x: i32,
     y: i32,
+    width: u32,
+    height: u32,
+    refresh_rate: f64,
+    scale: f64,
+    transform: i32,
 }
 
-fn hyprland_monitor_positions() -> Result<Vec<MonitorPosition>> {
-    let json = run("hyprctl", &["monitors", "-j"]).context("reading Hyprland monitor layout")?;
+fn hyprland_monitor_state() -> Result<Vec<MonitorState>> {
+    let json =
+        run("hyprctl", &["monitors", "-j"]).context("reading Hyprland monitor state")?;
 
     let monitors: serde_json::Value =
         serde_json::from_str(&json).context("parsing Hyprland monitor JSON")?;
@@ -134,7 +128,7 @@ fn hyprland_monitor_positions() -> Result<Vec<MonitorPosition>> {
         .as_array()
         .context("Hyprland monitor JSON is not an array")?;
 
-    let mut positions = Vec::with_capacity(monitors.len());
+    let mut states = Vec::with_capacity(monitors.len());
 
     for monitor in monitors {
         let name = monitor
@@ -152,43 +146,122 @@ fn hyprland_monitor_positions() -> Result<Vec<MonitorPosition>> {
             .and_then(|v| v.as_i64())
             .context("Hyprland monitor has no y position")?;
 
-        positions.push(MonitorPosition {
+        let width = monitor
+            .get("width")
+            .and_then(|v| v.as_u64())
+            .context("Hyprland monitor has no width")?;
+
+        let height = monitor
+            .get("height")
+            .and_then(|v| v.as_u64())
+            .context("Hyprland monitor has no height")?;
+
+        let refresh_rate = monitor
+            .get("refreshRate")
+            .and_then(|v| v.as_f64())
+            .context("Hyprland monitor has no refresh rate")?;
+
+        let scale = monitor
+            .get("scale")
+            .and_then(|v| v.as_f64())
+            .context("Hyprland monitor has no scale")?;
+
+        let transform = monitor
+            .get("transform")
+            .and_then(|v| v.as_i64())
+            .context("Hyprland monitor has no transform")?;
+
+        states.push(MonitorState {
             name: name.to_string(),
             x: i32::try_from(x).context("Hyprland monitor x position is out of range")?,
             y: i32::try_from(y).context("Hyprland monitor y position is out of range")?,
+            width: u32::try_from(width).context("Hyprland monitor width is out of range")?,
+            height: u32::try_from(height).context("Hyprland monitor height is out of range")?,
+            refresh_rate,
+            scale,
+            transform: i32::try_from(transform)
+                .context("Hyprland monitor transform is out of range")?,
         });
     }
 
-    Ok(positions)
+    Ok(states)
 }
 
-fn restore_hyprland_layout(
-    positions: &[MonitorPosition],
-    virtual_name: &str,
-    virtual_x: i32,
-    virtual_y: i32,
+fn lua_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+
+    escaped.push('"');
+    escaped
+}
+
+fn restore_hyprland_monitor_state(
+    states: &[MonitorState],
+    excluded_output: &str,
 ) -> Result<()> {
     let mut lua = String::new();
 
-    for monitor in positions {
-        if monitor.name == virtual_name {
+    for monitor in states {
+        if monitor.name == excluded_output {
             continue;
         }
 
+        let refresh = format!("{:.6}", monitor.refresh_rate)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+
+        let output = lua_string(&monitor.name);
+
         lua.push_str(&format!(
-            "hl.monitor({{ output = \"{}\", position = \"{}x{}\" }}); ",
-            monitor.name, monitor.x, monitor.y
+            "hl.monitor({{ output = {}, \
+             mode = \"{}x{}@{}\", \
+             position = \"{}x{}\", \
+             scale = {}, \
+             transform = {} }}); ",
+            output,
+            monitor.width,
+            monitor.height,
+            refresh,
+            monitor.x,
+            monitor.y,
+            monitor.scale,
+            monitor.transform
         ));
     }
 
-    lua.push_str(&format!(
-        "hl.monitor({{ output = \"{}\", position = \"{}x{}\", scale = 1 }})",
-        virtual_name, virtual_x, virtual_y
-    ));
+    if lua.ends_with("; ") {
+        lua.truncate(lua.len() - 2);
+    }
 
-    run("hyprctl", &["eval", &lua]).context("restoring Hyprland monitor layout")?;
+    run("hyprctl", &["eval", &lua]).context("restoring Hyprland monitor state")?;
 
     Ok(())
+}
+
+fn hyprland_monitor_lua(
+    name: &str,
+    width: u32,
+    height: u32,
+    refresh: u32,
+    x: i32,
+    y: i32,
+) -> String {
+    let output = lua_string(name);
+    format!(
+        "hl.monitor({{ output = {output}, mode = \"{width}x{height}@{refresh}\", position = \"{x}x{y}\", scale = 1 }})"
+    )
 }
 
 /// A headless output, removed when dropped.
@@ -198,19 +271,22 @@ pub struct VirtualOutput {
 }
 
 impl VirtualOutput {
-    pub fn create(name: &str, x: i32, y: i32) -> Result<Self> {
+    pub fn create(
+        name: &str,
+        width: u32,
+        height: u32,
+        refresh: u32,
+        x: i32,
+        y: i32,
+    ) -> Result<Self> {
         let compositor = Compositor::detect();
         match compositor {
             Compositor::Hyprland => {
-                let saved_positions = hyprland_monitor_positions()?;
+                let saved_states = hyprland_monitor_state()
+                    .context("saving Hyprland monitor state")?;
 
-                tracing::info!(
-                    "Hyprland layout BEFORE headless create: {:?}",
-                    saved_positions
-                );
-
-                if output_exists(compositor, name) {
-                    tracing::info!("reusing existing output {name}");
+                if saved_states.iter().any(|monitor| monitor.name == name) {
+                    tracing::debug!("reusing existing output {name}");
                 } else {
                     // Hyprland accepts an explicit name here, so the result is
                     // deterministic. Without one it allocates HEADLESS-N from a
@@ -218,26 +294,21 @@ impl VirtualOutput {
                     // guessing the name is a latent bug.
                     run("hyprctl", &["output", "create", "headless", name])
                         .context("creating headless output")?;
-
-                    let after_create = hyprland_monitor_positions()?;
-                    tracing::info!("Hyprland layout AFTER headless create: {:?}", after_create);
-
                     std::thread::sleep(std::time::Duration::from_millis(400));
                 }
-                // Hyprland 0.56+ reflows existing monitors when a headless
-                // output is created. Restore the complete layout in one Lua
-                // transaction after the new output has been registered.
-                tracing::info!(
-                    "restoring Hyprland layout: virtual output {} at {}x{}",
-                    name,
-                    x,
-                    y
-                );
 
-                restore_hyprland_layout(&saved_positions, name, x, y)?;
+                // Hyprland 0.57 responds "unknown request" to `hyprctl keyword`.
+                // The old conditional fallback consequently never ran, leaving
+                // the virtual output at 1920x1080 in the compositor's auto-layout.
+                // Use the supported Lua monitor API directly, unconditionally.
+                let lua = hyprland_monitor_lua(name, width, height, refresh, x, y);
+                if let Err(err) = run("hyprctl", &["eval", &lua]) {
+                    let _ = run("hyprctl", &["output", "remove", name]);
+                    return Err(err).with_context(|| format!("configuring output as {lua}"));
+                }
 
-                let after_restore = hyprland_monitor_positions()?;
-                tracing::info!("Hyprland layout AFTER restore: {:?}", after_restore);
+                restore_hyprland_monitor_state(&saved_states, name)
+                    .context("restoring Hyprland monitor state")?;
             }
             // Sway is UNTESTED and everything else is unsupported; both cases
             // report themselves.
@@ -263,8 +334,19 @@ impl Drop for VirtualOutput {
             Compositor::Unsupported => return,
         };
         match result {
-            Ok(_) => tracing::info!("removed output {}", self.name),
+            Ok(_) => tracing::debug!("removed output {}", self.name),
             Err(e) => tracing::warn!("failed to remove output {}: {e}", self.name),
         }
+    }
+}
+
+#[cfg(test)]
+mod monitor_lua_tests {
+    use super::*;
+
+    #[test]
+    fn generates_hyprland_057_lua_for_tablet_mode() {
+        let code = hyprland_monitor_lua("moreland", 1340, 800, 60, 0, 1080);
+        assert_eq!(code, "hl.monitor({ output = \"moreland\", mode = \"1340x800@60\", position = \"0x1080\", scale = 1 })");
     }
 }
